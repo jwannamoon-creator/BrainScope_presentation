@@ -19,7 +19,7 @@ def load_connectivity_matrix(dataset="sub-01", matrix_type="correlation"):
     - "partial"
     """
 
-    base_dir = Path(__file__).resolve().parent.parent
+    base_dir = Path(__file__).resolve().parent
     output_dir = base_dir
 
     if dataset == "sub-01":
