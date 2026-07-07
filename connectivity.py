@@ -20,7 +20,7 @@ def load_connectivity_matrix(dataset="sub-01", matrix_type="correlation"):
     """
 
     base_dir = Path(__file__).resolve().parent.parent
-    output_dir = base_dir / "connectivity_outputs"
+    output_dir = base_dir
 
     if dataset == "sub-01":
         prefix = "sub-01_aal3"
