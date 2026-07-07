@@ -8,3 +8,4 @@ networkx
 nibabel
 nilearn
 scikit-learn
+streamlit-autorefresh
