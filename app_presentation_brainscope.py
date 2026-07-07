@@ -9,16 +9,16 @@ from streamlit_autorefresh import st_autorefresh
 from nilearn import datasets
 from nilearn.surface import load_surf_mesh
 
-from brain_models.regions import REGIONS, CIRCUITS
-from brain_models.connectivity import (
+from regions import REGIONS, CIRCUITS
+from connectivity import (
     load_connectivity_matrix,
     load_group_difference_matrix,
     scale_matrix_for_wc,
 )
-from brain_models.wc import run_wc_network
-from brain_models.eeg import make_pseudo_eeg
-from brain_models.hh import run_hh
-from brain_models.lif import run_lif
+from wc import run_wc_network
+from eeg import make_pseudo_eeg
+from hh import run_hh
+from lif import run_lif
 
 
 # ============================================================
