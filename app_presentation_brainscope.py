@@ -1,5 +1,6 @@
 import time
 
+import pandas as pd
 import streamlit as st
 import numpy as np
 import plotly.graph_objects as go
@@ -578,6 +579,10 @@ else:
 
 st.subheader("4. Pseudo EEG")
 
+# 실행할 때마다 동일한 모의 EEG가 생성되도록 난수 시드를 고정함.
+# Healthy와 Depression 결과를 같은 조건에서 비교하기 위한 설정임.
+np.random.seed(42)
+
 pseudo_eeg, freqs, power = make_pseudo_eeg(E_wc, I_wc, noise=0.04)
 
 eeg_col1, eeg_col2 = st.columns(2)
@@ -602,6 +607,48 @@ with eeg_col2:
     ax.grid(True)
     st.pyplot(fig_fft)
 
+# ============================================================
+# CSV 다운로드
+# ============================================================
+
+# Raw EEG 데이터
+raw_eeg_df = pd.DataFrame({
+    "time": t_wc,
+    "pseudo_eeg": pseudo_eeg
+})
+
+# FFT 데이터
+fft_df = pd.DataFrame({
+    "frequency_hz": freqs,
+    "power": power
+})
+
+# 파일명에 사용할 안전한 문자열
+# 사이드바에서 실제로 사용 중인 변수명은 selected_circuit과
+# brain_dataset_label이므로 이 두 변수를 사용함.
+safe_circuit = selected_circuit.replace(" ", "_")
+safe_state = brain_dataset_label.replace(" ", "_")
+
+raw_eeg_csv = raw_eeg_df.to_csv(index=False).encode("utf-8-sig")
+fft_csv = fft_df.to_csv(index=False).encode("utf-8-sig")
+
+download_col1, download_col2 = st.columns(2)
+
+with download_col1:
+    st.download_button(
+        label="📥 Pseudo EEG Raw CSV 저장",
+        data=raw_eeg_csv,
+        file_name=f"{safe_state}_{safe_circuit}_pseudo_eeg_raw.csv",
+        mime="text/csv"
+    )
+
+with download_col2:
+    st.download_button(
+        label="📥 FFT Spectrum CSV 저장",
+        data=fft_csv,
+        file_name=f"{safe_state}_{safe_circuit}_pseudo_eeg_fft.csv",
+        mime="text/csv"
+    )
 
 # ============================================================
 # Simple neuron-level explanation
@@ -635,34 +682,3 @@ with st.expander("원리 설명용: 단일 뉴런과 뉴런 집단 모델 보기
         ax.set_ylabel("Neuron index")
         ax.set_title("LIF Population Raster Plot")
         st.pyplot(fig_lif)
-
-
-# ============================================================
-# Presentation summary
-# ============================================================
-
-st.subheader("5. 발표용 해석")
-
-st.write(
-    f"""
-    이 발표용 버전은 실제 resting-state fMRI에서 추출한 평균 functional connectivity를 이용해
-    **{selected_circuit}**의 신경집단 동역학을 시뮬레이션한다.
-    노드의 색과 크기는 Wilson–Cowan 모델에서 계산된 흥분성 activity를 나타내며,
-    Pseudo EEG는 회로 전체 activity를 합성하여 만든 관측 신호이다.
-    """
-)
-
-if view_mode == "Difference Network":
-    st.write(
-        """
-        Difference Network에서는 우울증군 평균 연결성에서 정상군 평균 연결성을 뺀 값을 표시하였다.
-        빨간색은 우울증군에서 상대적으로 강한 연결, 파란색은 우울증군에서 상대적으로 약한 연결을 의미한다.
-        """
-    )
-else:
-    st.write(
-        """
-        Brain Activity Map에서는 시간 슬라이더를 움직이며 각 뇌 영역의 activity가 어떻게 변하는지 확인할 수 있다.
-        이를 통해 하나의 연결성 행렬이 시간에 따른 신경집단 동역학과 EEG 유사 신호로 변환되는 과정을 시각적으로 볼 수 있다.
-        """
-    )
