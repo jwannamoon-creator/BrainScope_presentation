@@ -116,6 +116,175 @@ def build_connection_submatrix(dataset_id, active_regions):
 
     return conn_sub, W_external, wc_regions
 
+def prepare_laplacian_adjacency(conn_sub):
+    """
+    상관 기반 연결행렬을 Graph Laplacian 계산용
+    비음수 대칭 인접행렬로 변환한다.
+
+    - NaN과 무한값 제거
+    - 대칭화
+    - 상관계수 절댓값 사용
+    - 자기 연결 제거
+    """
+
+    adjacency = np.asarray(
+        conn_sub.values,
+        dtype=float,
+    )
+
+    adjacency = np.nan_to_num(
+        adjacency,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+    # 수치 오차로 인한 비대칭 제거
+    adjacency = (
+        adjacency + adjacency.T
+    ) / 2.0
+
+    # 일반적인 Laplacian의 λ₂ 해석을 위해 비음수 가중치 사용
+    adjacency = np.abs(adjacency)
+
+    # 자기 자신과의 상관계수 1 제거
+    np.fill_diagonal(adjacency, 0.0)
+
+    return adjacency
+
+
+def calculate_graph_laplacian(conn_sub):
+    """
+    비정규화 Graph Laplacian L = D - A를 계산하고
+    네트워크 지표를 반환한다.
+    """
+
+    adjacency = prepare_laplacian_adjacency(
+        conn_sub
+    )
+
+    weighted_degree = np.sum(
+        adjacency,
+        axis=1,
+    )
+
+    degree_matrix = np.diag(
+        weighted_degree
+    )
+
+    laplacian = (
+        degree_matrix - adjacency
+    )
+
+    # 대칭행렬이므로 eigvalsh 사용
+    laplacian_eigenvalues = np.linalg.eigvalsh(
+        laplacian
+    )
+
+    adjacency_eigenvalues = np.linalg.eigvalsh(
+        adjacency
+    )
+
+    # 아주 작은 수치 오차를 0으로 처리
+    laplacian_eigenvalues[
+        np.abs(laplacian_eigenvalues) < 1e-10
+    ] = 0.0
+
+    laplacian_eigenvalues = np.sort(
+        laplacian_eigenvalues
+    )
+
+    if len(laplacian_eigenvalues) >= 2:
+        algebraic_connectivity = float(
+            laplacian_eigenvalues[1]
+        )
+    else:
+        algebraic_connectivity = 0.0
+
+    metrics = {
+        "algebraic_connectivity": (
+            algebraic_connectivity
+        ),
+        "largest_laplacian_eigenvalue": float(
+            laplacian_eigenvalues[-1]
+        ),
+        "average_weighted_degree": float(
+            np.mean(weighted_degree)
+        ),
+        "spectral_radius": float(
+            np.max(np.abs(adjacency_eigenvalues))
+        ),
+        "total_edge_weight": float(
+            np.sum(adjacency) / 2.0
+        ),
+    }
+
+    return {
+        "adjacency": adjacency,
+        "degree_matrix": degree_matrix,
+        "laplacian": laplacian,
+        "eigenvalues": laplacian_eigenvalues,
+        "weighted_degree": weighted_degree,
+        "metrics": metrics,
+    }
+
+
+def build_laplacian_comparison(active_regions):
+    """
+    현재 회로에 대해 Healthy와 Depression 연결행렬을
+    같은 영역 순서로 정렬하여 Laplacian을 비교한다.
+    """
+
+    healthy_df = load_connectivity_matrix(
+        "control_mean",
+        "correlation",
+    )
+
+    depression_df = load_connectivity_matrix(
+        "depression_mean",
+        "correlation",
+    )
+
+    common_regions = [
+        region
+        for region in active_regions
+        if (
+            region in healthy_df.index
+            and region in healthy_df.columns
+            and region in depression_df.index
+            and region in depression_df.columns
+        )
+    ]
+
+    if len(common_regions) < 2:
+        raise ValueError(
+            "Graph Laplacian 계산에 필요한 공통 영역이 "
+            "2개 미만입니다."
+        )
+
+    healthy_sub = healthy_df.loc[
+        common_regions,
+        common_regions,
+    ]
+
+    depression_sub = depression_df.loc[
+        common_regions,
+        common_regions,
+    ]
+
+    healthy_result = calculate_graph_laplacian(
+        healthy_sub
+    )
+
+    depression_result = calculate_graph_laplacian(
+        depression_sub
+    )
+
+    return (
+        common_regions,
+        healthy_result,
+        depression_result,
+    )
 
 def draw_brain(
     active_regions,
@@ -793,6 +962,29 @@ except Exception as e:
     t_wc, E_wc, I_wc = run_wc_network(active_regions, "Normal")
     status_message = "기본 연결 행렬을 사용합니다."
 
+# ============================================================
+# Graph Laplacian analysis
+# ============================================================
+
+try:
+    (
+        laplacian_regions,
+        healthy_laplacian_result,
+        depression_laplacian_result,
+    ) = build_laplacian_comparison(
+        active_regions
+    )
+
+    laplacian_available = True
+    laplacian_error_message = None
+
+except Exception as e:
+    laplacian_available = False
+    laplacian_error_message = str(e)
+
+    laplacian_regions = []
+    healthy_laplacian_result = None
+    depression_laplacian_result = None
 
 if selected_region not in active_regions:
     selected_region = active_regions[0]
@@ -998,12 +1190,329 @@ else:
     ax.grid(True)
     st.pyplot(fig_network)
 
+# ============================================================
+# Graph Laplacian Network Analysis
+# ============================================================
+
+st.subheader("4. Graph Laplacian Network Analysis")
+
+st.caption(
+    "연결행렬의 절댓값을 비음수 가중 인접행렬 A로 사용하고, "
+    "차수행렬 D를 계산하여 비정규화 라플라시안 L = D - A를 "
+    "구했습니다. λ₂는 회로의 전체적 연결성과 통합 정도를 "
+    "나타내는 algebraic connectivity입니다."
+)
+
+if laplacian_available:
+
+    healthy_metrics = (
+        healthy_laplacian_result["metrics"]
+    )
+
+    depression_metrics = (
+        depression_laplacian_result["metrics"]
+    )
+
+    lap_col1, lap_col2, lap_col3, lap_col4 = st.columns(4)
+
+    with lap_col1:
+        st.metric(
+            "Healthy λ₂",
+            (
+                f"{healthy_metrics['algebraic_connectivity']:.4f}"
+            ),
+            help=(
+                "두 번째로 작은 Laplacian 고유값. "
+                "값이 클수록 네트워크가 전체적으로 강하게 "
+                "연결되어 있음을 의미합니다."
+            ),
+        )
+
+    with lap_col2:
+        lambda2_difference = (
+            depression_metrics[
+                "algebraic_connectivity"
+            ]
+            - healthy_metrics[
+                "algebraic_connectivity"
+            ]
+        )
+
+        st.metric(
+            "Depression λ₂",
+            (
+                f"{depression_metrics['algebraic_connectivity']:.4f}"
+            ),
+            delta=f"{lambda2_difference:+.4f}",
+            delta_color="normal",
+            help=(
+                "Depression λ₂에서 Healthy λ₂를 뺀 값입니다."
+            ),
+        )
+
+    with lap_col3:
+        degree_difference = (
+            depression_metrics[
+                "average_weighted_degree"
+            ]
+            - healthy_metrics[
+                "average_weighted_degree"
+            ]
+        )
+
+        st.metric(
+            "Average weighted degree",
+            (
+                f"{depression_metrics['average_weighted_degree']:.4f}"
+            ),
+            delta=f"{degree_difference:+.4f}",
+            help=(
+                "Depression 값과 Healthy 대비 변화량입니다."
+            ),
+        )
+
+    with lap_col4:
+        radius_difference = (
+            depression_metrics["spectral_radius"]
+            - healthy_metrics["spectral_radius"]
+        )
+
+        st.metric(
+            "Adjacency spectral radius",
+            (
+                f"{depression_metrics['spectral_radius']:.4f}"
+            ),
+            delta=f"{radius_difference:+.4f}",
+            help=(
+                "인접행렬 고유값 절댓값 중 최댓값입니다."
+            ),
+        )
+
+    spectrum_col, matrix_col = st.columns(
+        [1.1, 1]
+    )
+
+    with spectrum_col:
+        fig_laplacian, ax = plt.subplots(
+            figsize=(7.5, 4.0)
+        )
+
+        healthy_eigenvalues = (
+            healthy_laplacian_result["eigenvalues"]
+        )
+
+        depression_eigenvalues = (
+            depression_laplacian_result["eigenvalues"]
+        )
+
+        healthy_indices = np.arange(
+            1,
+            len(healthy_eigenvalues) + 1,
+        )
+
+        depression_indices = np.arange(
+            1,
+            len(depression_eigenvalues) + 1,
+        )
+
+        ax.plot(
+            healthy_indices,
+            healthy_eigenvalues,
+            marker="o",
+            linewidth=2,
+            label="Healthy",
+        )
+
+        ax.plot(
+            depression_indices,
+            depression_eigenvalues,
+            marker="s",
+            linewidth=2,
+            label="Depression",
+        )
+
+        ax.axhline(
+            0.0,
+            linestyle="--",
+            alpha=0.5,
+        )
+
+        ax.set_xlabel("Eigenvalue index")
+        ax.set_ylabel("Laplacian eigenvalue")
+        ax.set_title(
+            f"{selected_circuit} Laplacian Spectrum"
+        )
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+        st.pyplot(fig_laplacian)
+        plt.close(fig_laplacian)
+
+    with matrix_col:
+        selected_laplacian_result = (
+            healthy_laplacian_result
+            if brain_dataset_label == "Healthy"
+            else depression_laplacian_result
+        )
+
+        fig_laplacian_matrix, ax = plt.subplots(
+            figsize=(6.5, 5.2)
+        )
+
+        laplacian_matrix = (
+            selected_laplacian_result["laplacian"]
+        )
+
+        vmax = np.max(
+            np.abs(laplacian_matrix)
+        )
+
+        if vmax == 0:
+            vmax = 1.0
+
+        image = ax.imshow(
+            laplacian_matrix,
+            cmap="bwr",
+            vmin=-vmax,
+            vmax=vmax,
+        )
+
+        ax.set_xticks(
+            range(len(laplacian_regions))
+        )
+        ax.set_xticklabels(
+            laplacian_regions,
+            rotation=45,
+            ha="right",
+            fontsize=8,
+        )
+
+        ax.set_yticks(
+            range(len(laplacian_regions))
+        )
+        ax.set_yticklabels(
+            laplacian_regions,
+            fontsize=8,
+        )
+
+        ax.set_title(
+            f"{brain_dataset_label} Graph Laplacian"
+        )
+
+        plt.colorbar(
+            image,
+            ax=ax,
+            label="Laplacian value",
+        )
+        plt.tight_layout()
+
+        st.pyplot(fig_laplacian_matrix)
+        plt.close(fig_laplacian_matrix)
+
+    # 수치 비교 표
+    laplacian_metrics_df = pd.DataFrame(
+        {
+            "Metric": [
+                "Algebraic connectivity λ₂",
+                "Largest Laplacian eigenvalue",
+                "Average weighted degree",
+                "Adjacency spectral radius",
+                "Total edge weight",
+            ],
+            "Healthy": [
+                healthy_metrics[
+                    "algebraic_connectivity"
+                ],
+                healthy_metrics[
+                    "largest_laplacian_eigenvalue"
+                ],
+                healthy_metrics[
+                    "average_weighted_degree"
+                ],
+                healthy_metrics[
+                    "spectral_radius"
+                ],
+                healthy_metrics[
+                    "total_edge_weight"
+                ],
+            ],
+            "Depression": [
+                depression_metrics[
+                    "algebraic_connectivity"
+                ],
+                depression_metrics[
+                    "largest_laplacian_eigenvalue"
+                ],
+                depression_metrics[
+                    "average_weighted_degree"
+                ],
+                depression_metrics[
+                    "spectral_radius"
+                ],
+                depression_metrics[
+                    "total_edge_weight"
+                ],
+            ],
+        }
+    )
+
+    laplacian_metrics_df["Depression - Healthy"] = (
+        laplacian_metrics_df["Depression"]
+        - laplacian_metrics_df["Healthy"]
+    )
+
+    st.dataframe(
+        laplacian_metrics_df.style.format(
+            {
+                "Healthy": "{:.5f}",
+                "Depression": "{:.5f}",
+                "Depression - Healthy": "{:+.5f}",
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # λ₂ 해석 자동 출력
+    healthy_lambda2 = healthy_metrics[
+        "algebraic_connectivity"
+    ]
+    depression_lambda2 = depression_metrics[
+        "algebraic_connectivity"
+    ]
+
+    if depression_lambda2 < healthy_lambda2:
+        st.info(
+            "이 회로에서는 Depression의 λ₂가 Healthy보다 낮게 "
+            "나타났습니다. 이는 사용한 가중 네트워크에서 우울증군의 "
+            "전반적 네트워크 통합성과 연결 강건성이 상대적으로 "
+            "낮아진 것으로 해석할 수 있습니다."
+        )
+
+    elif depression_lambda2 > healthy_lambda2:
+        st.info(
+            "이 회로에서는 Depression의 λ₂가 Healthy보다 높게 "
+            "나타났습니다. 이는 사용한 가중 네트워크에서 우울증군의 "
+            "전반적 결합이 더 강하거나 일부 연결이 과도하게 강화된 "
+            "상태일 가능성을 보여줍니다."
+        )
+
+    else:
+        st.info(
+            "Healthy와 Depression의 λ₂가 동일하게 나타났습니다."
+        )
+
+else:
+    st.warning(
+        "Graph Laplacian 분석을 수행하지 못했습니다: "
+        f"{laplacian_error_message}"
+    )
 
 # ============================================================
 # Pseudo EEG
 # ============================================================
 
-st.subheader("4. Pseudo EEG")
+st.subheader("5. Pseudo EEG")
 
 PSEUDO_EEG_SFREQ = 100.0
 
