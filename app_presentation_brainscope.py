@@ -248,54 +248,23 @@ def draw_brain(
 
     return fig
 
-
-
 def make_pseudo_eeg_100hz(
     t,
     E,
     I,
     sfreq=100.0,
-    noise=0.04,
+    noise=0.03,
     random_state=42,
 ):
-    """
-    Wilson-Cowan E/I activity를 100 Hz 시간축으로 보간한 뒤,
-    1~40 Hz 범위의 모의 EEG를 생성하고 Welch PSD를 계산한다.
-
-    주의:
-    이 신호는 실제 두피 EEG가 아니라 회로 활동을 시각화하기 위한
-    모의 신호이며, 절대 진폭보다 PSD 형태와 조건 간 변화 방향을
-    비교하는 데 사용한다.
-    """
 
     t = np.asarray(t, dtype=float)
     E = np.asarray(E, dtype=float)
     I = np.asarray(I, dtype=float)
 
-    if t.ndim != 1:
-        raise ValueError("t는 1차원 시간 배열이어야 합니다.")
-
-    if E.ndim != 2 or I.ndim != 2:
-        raise ValueError("E와 I는 (영역 수, 시간점 수) 형태의 2차원 배열이어야 합니다.")
-
-    if E.shape != I.shape:
-        raise ValueError("E와 I의 배열 크기가 서로 같아야 합니다.")
-
-    if E.shape[1] != len(t):
-        raise ValueError("E/I의 시간축 길이와 t의 길이가 일치해야 합니다.")
-
-    if sfreq <= 80:
-        raise ValueError("40 Hz까지 분석하려면 sfreq는 80 Hz보다 커야 합니다.")
-
-    duration = float(t[-1] - t[0])
-
-    if duration <= 0:
-        raise ValueError("기록 길이가 0초보다 커야 합니다.")
-
     pseudo_time = np.arange(
         t[0],
-        t[-1] + 0.5 / sfreq,
-        1.0 / sfreq,
+        t[-1] + 0.5/sfreq,
+        1/sfreq,
     )
 
     mean_E = np.mean(E, axis=0)
@@ -304,49 +273,78 @@ def make_pseudo_eeg_100hz(
     interp_E = np.interp(pseudo_time, t, mean_E)
     interp_I = np.interp(pseudo_time, t, mean_I)
 
-    circuit_signal = interp_E - 0.6 * interp_I
-    circuit_signal = circuit_signal - np.mean(circuit_signal)
+    # -------------------------
+    # Wilson-Cowan source
+    # -------------------------
 
-    signal_std = np.std(circuit_signal)
-    if signal_std > 0:
-        circuit_signal = circuit_signal / signal_std
+    circuit_signal = interp_E - 0.8*interp_I
 
-    # E/I 상태에 따라 진동 성분의 상대 진폭이 조금씩 달라지도록 설정
-    excitation_level = float(np.clip(np.mean(interp_E), 0.0, 1.0))
-    inhibition_level = float(np.clip(np.mean(interp_I), 0.0, 1.0))
-    variability = float(np.clip(np.std(interp_E - interp_I), 0.0, 1.0))
+    circuit_signal -= np.mean(circuit_signal)
+    circuit_signal /= np.std(circuit_signal)
 
-    delta_amp = 0.18 + 0.12 * inhibition_level
-    theta_amp = 0.16 + 0.16 * variability
-    alpha_amp = 0.28 + 0.18 * inhibition_level
-    beta_amp = 0.14 + 0.18 * excitation_level
-    gamma_amp = 0.06 + 0.10 * excitation_level
+    excitation = np.clip(np.mean(interp_E),0,1)
+    inhibition = np.clip(np.mean(interp_I),0,1)
 
-    envelope = 0.75 + 0.25 * np.tanh(interp_E - interp_I)
+    variability = np.std(interp_E-interp_I)
 
-    oscillation = (
-        delta_amp * np.sin(2 * np.pi * 2.5 * pseudo_time)
-        + theta_amp * np.sin(2 * np.pi * 6.0 * pseudo_time + 0.4)
-        + alpha_amp * np.sin(2 * np.pi * 10.0 * pseudo_time + 0.8)
-        + beta_amp * np.sin(2 * np.pi * 20.0 * pseudo_time + 1.2)
-        + gamma_amp * np.sin(2 * np.pi * 35.0 * pseudo_time + 0.2)
+    # -------------------------
+    # amplitude
+    # -------------------------
+
+    delta_amp = 0.18 + 0.18*inhibition
+    theta_amp = 0.18 + 0.25*variability
+    alpha_amp = 0.22 + 0.10*inhibition
+    beta_amp = 0.16 + 0.25*excitation
+    gamma_amp = 0.05 + 0.18*excitation
+
+    # -------------------------
+    # envelope
+    # -------------------------
+
+    envelope = 1 + 0.35*np.tanh(circuit_signal)
+
+    envelope += 0.15*np.sin(
+        2*np.pi*0.2*pseudo_time
     )
 
     rng = np.random.default_rng(random_state)
 
-    pseudo_eeg = (
-        0.35 * circuit_signal
-        + envelope * oscillation
-        + rng.normal(0.0, noise, size=len(pseudo_time))
+    phase = rng.uniform(0,2*np.pi,5)
+
+    oscillation = (
+        delta_amp*np.sin(2*np.pi*2.5*pseudo_time+phase[0])+
+        theta_amp*np.sin(2*np.pi*6*pseudo_time+phase[1])+
+        alpha_amp*np.sin(2*np.pi*10*pseudo_time+phase[2])+
+        beta_amp*np.sin(2*np.pi*20*pseudo_time+phase[3])+
+        gamma_amp*np.sin(2*np.pi*35*pseudo_time+phase[4])
     )
 
-    pseudo_eeg = pseudo_eeg - np.mean(pseudo_eeg)
+    oscillation *= envelope
 
-    # 4초 Welch 창, 50% 중첩
-    nperseg = min(int(4 * sfreq), len(pseudo_eeg))
-    noverlap = nperseg // 2
+    # -------------------------
+    # colored noise
+    # -------------------------
 
-    freqs, power = welch(
+    white = rng.normal(size=len(pseudo_time))
+
+    colored = np.cumsum(white)
+    colored -= np.mean(colored)
+    colored /= np.std(colored)
+
+    pseudo_eeg = (
+        0.45*circuit_signal
+        + oscillation
+        + 0.18*colored
+        + rng.normal(0,noise,len(pseudo_time))
+    )
+
+    pseudo_eeg -= np.mean(pseudo_eeg)
+    pseudo_eeg /= np.std(pseudo_eeg)
+
+    nperseg = min(int(4*sfreq),len(pseudo_eeg))
+    noverlap = nperseg//2
+
+    freqs,power = welch(
         pseudo_eeg,
         fs=sfreq,
         window="hann",
@@ -356,14 +354,15 @@ def make_pseudo_eeg_100hz(
         scaling="density",
     )
 
-    frequency_mask = (freqs >= 0.0) & (freqs <= 40.0)
+    mask=(freqs>=0)&(freqs<=40)
 
     return (
         pseudo_time,
         pseudo_eeg,
-        freqs[frequency_mask],
-        power[frequency_mask],
+        freqs[mask],
+        power[mask],
     )
+
 
 
 # ============================================================
