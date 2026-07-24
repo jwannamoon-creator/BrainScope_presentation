@@ -6,6 +6,11 @@ import numpy as np
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 
+from pathlib import Path
+
+from scipy.stats import pearsonr
+from scipy.spatial.distance import cosine
+
 from scipy.signal import welch, butter, sosfiltfilt
 
 from streamlit_autorefresh import st_autorefresh
@@ -873,6 +878,523 @@ def make_pseudo_eeg_100hz(
         target_profile,
     )
 
+# ============================================================
+# Real EEG vs Pseudo EEG validation
+# ============================================================
+
+REAL_EEG_PSD_FILES = {
+    "Healthy": Path(
+        "real_eeg_reference/real_healthy_psd.csv"
+    ),
+    "Depression": Path(
+        "real_eeg_reference/real_depression_psd.csv"
+    ),
+}
+
+VALIDATION_BANDS = {
+    "Delta": (1.0, 4.0),
+    "Theta": (4.0, 8.0),
+    "Alpha": (8.0, 13.0),
+    "Beta": (13.0, 30.0),
+    "Gamma": (30.0, 40.0),
+}
+
+
+def _find_column(
+    dataframe,
+    candidate_names,
+):
+    """
+    대소문자와 일부 열 이름 차이를 허용해
+    적절한 CSV 열을 찾는다.
+    """
+
+    normalized_columns = {
+        str(column).strip().lower(): column
+        for column in dataframe.columns
+    }
+
+    for candidate in candidate_names:
+        candidate_normalized = (
+            candidate.strip().lower()
+        )
+
+        if candidate_normalized in normalized_columns:
+            return normalized_columns[
+                candidate_normalized
+            ]
+
+    # 정확히 일치하지 않을 경우 부분 문자열 탐색
+    for column in dataframe.columns:
+        normalized_column = (
+            str(column).strip().lower()
+        )
+
+        for candidate in candidate_names:
+            if candidate.lower() in normalized_column:
+                return column
+
+    raise ValueError(
+        "필요한 열을 찾지 못했습니다. "
+        f"후보 열 이름: {candidate_names}"
+    )
+
+
+@st.cache_data
+def load_real_eeg_psd(
+    brain_state,
+):
+    """
+    실제 EEG PSD CSV를 불러오고 1–40 Hz 구간만 반환한다.
+    """
+
+    file_path = REAL_EEG_PSD_FILES[
+        brain_state
+    ]
+
+    if not file_path.exists():
+        raise FileNotFoundError(
+            f"실제 EEG PSD 파일을 찾지 못했습니다: "
+            f"{file_path}"
+        )
+
+    dataframe = pd.read_csv(
+        file_path
+    )
+
+    frequency_column = _find_column(
+        dataframe,
+        [
+            "frequency_hz",
+            "frequency",
+            "freq",
+            "freqs",
+            "hz",
+        ],
+    )
+
+    power_column = _find_column(
+    dataframe,
+    [
+        "mean_psd_uV2_per_Hz",
+        "mean_psd_V2_per_Hz",
+        "normalized_power",
+        "normalized_psd",
+        "power",
+        "psd",
+        "density",
+    ],
+)
+
+    frequencies = pd.to_numeric(
+        dataframe[frequency_column],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+
+    power = pd.to_numeric(
+        dataframe[power_column],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+
+    valid_mask = (
+        np.isfinite(frequencies)
+        & np.isfinite(power)
+        & (frequencies >= 1.0)
+        & (frequencies <= 40.0)
+        & (power >= 0.0)
+    )
+
+    frequencies = frequencies[
+        valid_mask
+    ]
+    power = power[
+        valid_mask
+    ]
+
+    sort_indices = np.argsort(
+        frequencies
+    )
+
+    frequencies = frequencies[
+        sort_indices
+    ]
+    power = power[
+        sort_indices
+    ]
+
+    if len(frequencies) < 3:
+        raise ValueError(
+            f"{brain_state} 실제 EEG PSD에 "
+            "유효한 주파수점이 충분하지 않습니다."
+        )
+
+    return frequencies, power
+
+
+def normalize_psd_area(
+    frequencies,
+    power,
+    low_frequency=1.0,
+    high_frequency=40.0,
+):
+    """
+    지정 주파수 범위의 PSD 면적이 1이 되도록 정규화한다.
+    """
+
+    frequencies = np.asarray(
+        frequencies,
+        dtype=float,
+    )
+
+    power = np.asarray(
+        power,
+        dtype=float,
+    )
+
+    mask = (
+        (frequencies >= low_frequency)
+        & (frequencies <= high_frequency)
+        & np.isfinite(power)
+        & (power >= 0.0)
+    )
+
+    selected_frequencies = frequencies[
+        mask
+    ]
+
+    selected_power = power[
+        mask
+    ]
+
+    if len(selected_frequencies) < 3:
+        raise ValueError(
+            "PSD 정규화에 필요한 주파수점이 부족합니다."
+        )
+
+    total_area = np.trapz(
+        selected_power,
+        selected_frequencies,
+    )
+
+    if total_area <= 1e-15:
+        raise ValueError(
+            "PSD 전체 면적이 0에 가깝습니다."
+        )
+
+    normalized_power = (
+        selected_power / total_area
+    )
+
+    return (
+        selected_frequencies,
+        normalized_power,
+    )
+
+
+def calculate_relative_band_power(
+    frequencies,
+    normalized_power,
+):
+    """
+    정규화 PSD에서 각 EEG 대역의 상대 파워를 계산한다.
+    """
+
+    frequencies = np.asarray(
+        frequencies,
+        dtype=float,
+    )
+
+    normalized_power = np.asarray(
+        normalized_power,
+        dtype=float,
+    )
+
+    band_power = {}
+
+    for band_name, (
+        low_frequency,
+        high_frequency,
+    ) in VALIDATION_BANDS.items():
+
+        # 경계 중복을 최소화한다.
+        if band_name == "Gamma":
+            mask = (
+                (frequencies >= low_frequency)
+                & (frequencies <= high_frequency)
+            )
+        else:
+            mask = (
+                (frequencies >= low_frequency)
+                & (frequencies < high_frequency)
+            )
+
+        if np.sum(mask) < 2:
+            band_power[band_name] = np.nan
+            continue
+
+        band_power[band_name] = float(
+            np.trapz(
+                normalized_power[mask],
+                frequencies[mask],
+            )
+        )
+
+    valid_total = np.nansum(
+        list(band_power.values())
+    )
+
+    if valid_total > 1e-15:
+        band_power = {
+            band_name: (
+                value / valid_total
+                if np.isfinite(value)
+                else np.nan
+            )
+            for band_name, value in band_power.items()
+        }
+
+    return band_power
+
+
+def compare_real_and_pseudo_psd(
+    real_frequencies,
+    real_power,
+    pseudo_frequencies,
+    pseudo_power,
+):
+    """
+    실제 PSD와 pseudo PSD를 같은 주파수축으로 맞추고
+    Pearson, cosine, RMSE, NRMSE를 계산한다.
+    """
+
+    (
+        real_frequencies,
+        real_normalized_power,
+    ) = normalize_psd_area(
+        real_frequencies,
+        real_power,
+    )
+
+    (
+        pseudo_frequencies,
+        pseudo_normalized_power,
+    ) = normalize_psd_area(
+        pseudo_frequencies,
+        pseudo_power,
+    )
+
+    # 실제 EEG 주파수축에 pseudo PSD를 보간
+    pseudo_interpolated = np.interp(
+        real_frequencies,
+        pseudo_frequencies,
+        pseudo_normalized_power,
+    )
+
+    # 보간 뒤 다시 면적 정규화
+    pseudo_area = np.trapz(
+        pseudo_interpolated,
+        real_frequencies,
+    )
+
+    if pseudo_area > 1e-15:
+        pseudo_interpolated = (
+            pseudo_interpolated
+            / pseudo_area
+        )
+
+    pearson_r, pearson_p = pearsonr(
+        real_normalized_power,
+        pseudo_interpolated,
+    )
+
+    cosine_similarity = (
+        1.0
+        - cosine(
+            real_normalized_power,
+            pseudo_interpolated,
+        )
+    )
+
+    rmse = float(
+        np.sqrt(
+            np.mean(
+                (
+                    real_normalized_power
+                    - pseudo_interpolated
+                )
+                ** 2
+            )
+        )
+    )
+
+    real_range = float(
+        np.max(real_normalized_power)
+        - np.min(real_normalized_power)
+    )
+
+    nrmse = (
+        rmse / real_range
+        if real_range > 1e-15
+        else np.nan
+    )
+
+    real_band_power = (
+        calculate_relative_band_power(
+            real_frequencies,
+            real_normalized_power,
+        )
+    )
+
+    pseudo_band_power = (
+        calculate_relative_band_power(
+            real_frequencies,
+            pseudo_interpolated,
+        )
+    )
+
+    return {
+        "frequencies": real_frequencies,
+        "real_normalized_power": (
+            real_normalized_power
+        ),
+        "pseudo_normalized_power": (
+            pseudo_interpolated
+        ),
+        "pearson_r": float(
+            pearson_r
+        ),
+        "pearson_p": float(
+            pearson_p
+        ),
+        "cosine_similarity": float(
+            cosine_similarity
+        ),
+        "rmse": rmse,
+        "nrmse": float(
+            nrmse
+        ),
+        "real_band_power": (
+            real_band_power
+        ),
+        "pseudo_band_power": (
+            pseudo_band_power
+        ),
+    }
+
+
+def generate_condition_pseudo_eeg(
+    circuit,
+    brain_state,
+    sfreq=100.0,
+):
+    """
+    Healthy/Depression 방향 비교를 위해 특정 상태의
+    Wilson–Cowan 활동과 pseudo EEG를 독립적으로 생성한다.
+    """
+
+    circuit_regions = (
+        CIRCUITS[circuit]["regions"].copy()
+    )
+
+    dataset_id = get_dataset_id(
+        brain_state
+    )
+
+    (
+        condition_conn_sub,
+        condition_W_external,
+        condition_regions,
+    ) = build_connection_submatrix(
+        dataset_id,
+        circuit_regions,
+    )
+
+    (
+        condition_t,
+        condition_E,
+        condition_I,
+    ) = run_wc_network(
+        condition_regions,
+        "Normal",
+        W_external=condition_W_external,
+    )
+
+    (
+        condition_pseudo_time,
+        condition_pseudo_eeg,
+        condition_frequencies,
+        condition_power,
+        condition_target_profile,
+    ) = make_pseudo_eeg_100hz(
+        t=condition_t,
+        E=condition_E,
+        I=condition_I,
+        region_names=condition_regions,
+        circuit=circuit,
+        brain_state=brain_state,
+        sfreq=sfreq,
+        noise=0.025,
+        random_state=42,
+        wc_mix=0.18,
+    )
+
+    return {
+        "time": condition_pseudo_time,
+        "signal": condition_pseudo_eeg,
+        "frequencies": condition_frequencies,
+        "power": condition_power,
+        "target_profile": (
+            condition_target_profile
+        ),
+    }
+
+
+def get_change_direction(
+    healthy_value,
+    depression_value,
+    tolerance=1e-6,
+):
+    difference = (
+        depression_value
+        - healthy_value
+    )
+
+    if difference > tolerance:
+        return "Increase"
+
+    if difference < -tolerance:
+        return "Decrease"
+
+    return "No change"
+
+
+def describe_similarity(
+    pearson_r,
+    cosine_similarity,
+):
+    """
+    앱 표시용 보수적인 정성 평가.
+    """
+
+    if (
+        pearson_r >= 0.70
+        and cosine_similarity >= 0.80
+    ):
+        return "High"
+
+    if (
+        pearson_r >= 0.50
+        and cosine_similarity >= 0.70
+    ):
+        return "Moderate to high"
+
+    if (
+        pearson_r >= 0.30
+        and cosine_similarity >= 0.50
+    ):
+        return "Moderate"
+
+    return "Low"
 
 # ============================================================
 # Sidebar: Presentation UI
@@ -1566,6 +2088,35 @@ PSEUDO_EEG_SFREQ = 100.0
     wc_mix=0.18,
 )
 
+# STEP 9에서 Healthy→Depression 대역 변화 방향을 비교하기 위해
+# 현재 회로의 두 상태 pseudo EEG를 모두 생성한다.
+try:
+    healthy_condition_pseudo = (
+        generate_condition_pseudo_eeg(
+            circuit=selected_circuit,
+            brain_state="Healthy",
+            sfreq=PSEUDO_EEG_SFREQ,
+        )
+    )
+
+    depression_condition_pseudo = (
+        generate_condition_pseudo_eeg(
+            circuit=selected_circuit,
+            brain_state="Depression",
+            sfreq=PSEUDO_EEG_SFREQ,
+        )
+    )
+
+    condition_pseudo_available = True
+    condition_pseudo_error = None
+
+except Exception as e:
+    condition_pseudo_available = False
+    condition_pseudo_error = str(e)
+
+    healthy_condition_pseudo = None
+    depression_condition_pseudo = None
+
 eeg_col1, eeg_col2 = st.columns(2)
 
 with eeg_col1:
@@ -1627,6 +2178,459 @@ with st.expander("Pseudo EEG v2 목표 상대 대역 파워"):
             }
         ),
         use_container_width=True,
+    )
+
+# ============================================================
+# STEP 9. Real EEG vs Pseudo EEG validation
+# ============================================================
+
+st.subheader("6. Real EEG vs Pseudo EEG Validation")
+
+st.caption(
+    "실제 EEG와 BrainScope pseudo EEG의 1–40 Hz Welch PSD를 "
+    "면적 정규화한 뒤 동일 주파수축에서 비교합니다. "
+    "Pearson은 PSD 형태의 선형 유사도, cosine similarity는 "
+    "스펙트럼 방향 유사도, RMSE는 주파수별 차이를 나타냅니다."
+)
+
+try:
+    (
+        real_frequencies,
+        real_power,
+    ) = load_real_eeg_psd(
+        brain_dataset_label
+    )
+
+    validation_result = (
+        compare_real_and_pseudo_psd(
+            real_frequencies=real_frequencies,
+            real_power=real_power,
+            pseudo_frequencies=freqs,
+            pseudo_power=power,
+        )
+    )
+
+    validation_available = True
+    validation_error_message = None
+
+except Exception as e:
+    validation_available = False
+    validation_error_message = str(e)
+    validation_result = None
+
+
+if validation_available:
+
+    similarity_level = describe_similarity(
+        validation_result["pearson_r"],
+        validation_result[
+            "cosine_similarity"
+        ],
+    )
+
+    metric_col1, metric_col2, metric_col3, metric_col4 = (
+        st.columns(4)
+    )
+
+    with metric_col1:
+        st.metric(
+            "Pearson r",
+            (
+                f"{validation_result['pearson_r']:.3f}"
+            ),
+            help=(
+                "실제 PSD와 pseudo PSD의 주파수별 "
+                "선형 상관계수입니다."
+            ),
+        )
+
+    with metric_col2:
+        st.metric(
+            "Cosine similarity",
+            (
+                f"{validation_result['cosine_similarity']:.3f}"
+            ),
+            help=(
+                "두 스펙트럼 벡터의 방향 유사도입니다. "
+                "1에 가까울수록 유사합니다."
+            ),
+        )
+
+    with metric_col3:
+        st.metric(
+            "RMSE",
+            (
+                f"{validation_result['rmse']:.5f}"
+            ),
+            help=(
+                "주파수별 정규화 PSD 차이의 "
+                "제곱평균제곱근입니다."
+            ),
+        )
+
+    with metric_col4:
+        st.metric(
+            "Similarity",
+            similarity_level,
+        )
+
+    # --------------------------------------------------------
+    # PSD 중첩 비교
+    # --------------------------------------------------------
+
+    fig_validation, ax = plt.subplots(
+        figsize=(10, 4.2)
+    )
+
+    ax.plot(
+        validation_result["frequencies"],
+        validation_result[
+            "real_normalized_power"
+        ],
+        linewidth=2.2,
+        label=f"Real {brain_dataset_label}",
+    )
+
+    ax.plot(
+        validation_result["frequencies"],
+        validation_result[
+            "pseudo_normalized_power"
+        ],
+        linewidth=1.8,
+        alpha=0.85,
+        label=(
+            f"Pseudo {brain_dataset_label} "
+            f"{selected_circuit.replace(' Circuit', '')}"
+        ),
+    )
+
+    ax.set_xlim(1, 40)
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Normalized PSD")
+    ax.set_title(
+        f"Real vs Pseudo EEG Spectrum — "
+        f"{brain_dataset_label}, {selected_circuit}"
+    )
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    st.pyplot(fig_validation)
+    plt.close(fig_validation)
+
+    # --------------------------------------------------------
+    # 상대 대역 파워 비교
+    # --------------------------------------------------------
+
+    real_band_power = validation_result[
+        "real_band_power"
+    ]
+
+    pseudo_band_power = validation_result[
+        "pseudo_band_power"
+    ]
+
+    band_power_df = pd.DataFrame(
+        {
+            "Band": list(
+                VALIDATION_BANDS.keys()
+            ),
+            "Real": [
+                real_band_power[band]
+                for band in VALIDATION_BANDS
+            ],
+            "Pseudo": [
+                pseudo_band_power[band]
+                for band in VALIDATION_BANDS
+            ],
+        }
+    )
+
+    band_power_df["Pseudo - Real"] = (
+        band_power_df["Pseudo"]
+        - band_power_df["Real"]
+    )
+
+    band_table_col, band_graph_col = (
+        st.columns([1, 1.25])
+    )
+
+    with band_table_col:
+        st.markdown(
+            "### Relative band power"
+        )
+
+        st.dataframe(
+            band_power_df.style.format(
+                {
+                    "Real": "{:.4f}",
+                    "Pseudo": "{:.4f}",
+                    "Pseudo - Real": "{:+.4f}",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with band_graph_col:
+        fig_band, ax = plt.subplots(
+            figsize=(7, 4)
+        )
+
+        band_indices = np.arange(
+            len(band_power_df)
+        )
+
+        bar_width = 0.36
+
+        ax.bar(
+            band_indices - bar_width / 2,
+            band_power_df["Real"],
+            width=bar_width,
+            label="Real",
+        )
+
+        ax.bar(
+            band_indices + bar_width / 2,
+            band_power_df["Pseudo"],
+            width=bar_width,
+            label="Pseudo",
+        )
+
+        ax.set_xticks(
+            band_indices
+        )
+        ax.set_xticklabels(
+            band_power_df["Band"]
+        )
+        ax.set_ylabel(
+            "Relative power"
+        )
+        ax.set_title(
+            "EEG Band Power Comparison"
+        )
+        ax.grid(
+            True,
+            axis="y",
+            alpha=0.3,
+        )
+        ax.legend()
+
+        st.pyplot(fig_band)
+        plt.close(fig_band)
+
+    st.caption(
+        f"Pearson p-value: "
+        f"{validation_result['pearson_p']:.3e} · "
+        f"NRMSE: {validation_result['nrmse']:.4f}"
+    )
+
+else:
+    st.warning(
+        "실제 EEG 검증을 수행하지 못했습니다: "
+        f"{validation_error_message}"
+    )
+
+    st.code(
+        "real_eeg_reference/\n"
+        "├─ real_healthy_psd.csv\n"
+        "└─ real_depression_psd.csv"
+    )
+
+
+# ------------------------------------------------------------
+# Healthy → Depression direction match
+# ------------------------------------------------------------
+
+st.markdown(
+    "### Healthy → Depression band-direction validation"
+)
+
+try:
+    if not condition_pseudo_available:
+        raise RuntimeError(
+            condition_pseudo_error
+        )
+
+    (
+        real_healthy_frequencies,
+        real_healthy_power,
+    ) = load_real_eeg_psd(
+        "Healthy"
+    )
+
+    (
+        real_depression_frequencies,
+        real_depression_power,
+    ) = load_real_eeg_psd(
+        "Depression"
+    )
+
+    (
+        real_healthy_frequencies,
+        real_healthy_normalized,
+    ) = normalize_psd_area(
+        real_healthy_frequencies,
+        real_healthy_power,
+    )
+
+    (
+        real_depression_frequencies,
+        real_depression_normalized,
+    ) = normalize_psd_area(
+        real_depression_frequencies,
+        real_depression_power,
+    )
+
+    real_healthy_bands = (
+        calculate_relative_band_power(
+            real_healthy_frequencies,
+            real_healthy_normalized,
+        )
+    )
+
+    real_depression_bands = (
+        calculate_relative_band_power(
+            real_depression_frequencies,
+            real_depression_normalized,
+        )
+    )
+
+    (
+        pseudo_healthy_frequencies,
+        pseudo_healthy_normalized,
+    ) = normalize_psd_area(
+        healthy_condition_pseudo[
+            "frequencies"
+        ],
+        healthy_condition_pseudo[
+            "power"
+        ],
+    )
+
+    (
+        pseudo_depression_frequencies,
+        pseudo_depression_normalized,
+    ) = normalize_psd_area(
+        depression_condition_pseudo[
+            "frequencies"
+        ],
+        depression_condition_pseudo[
+            "power"
+        ],
+    )
+
+    pseudo_healthy_bands = (
+        calculate_relative_band_power(
+            pseudo_healthy_frequencies,
+            pseudo_healthy_normalized,
+        )
+    )
+
+    pseudo_depression_bands = (
+        calculate_relative_band_power(
+            pseudo_depression_frequencies,
+            pseudo_depression_normalized,
+        )
+    )
+
+    direction_rows = []
+
+    for band_name in VALIDATION_BANDS:
+
+        real_direction = get_change_direction(
+            real_healthy_bands[band_name],
+            real_depression_bands[band_name],
+        )
+
+        pseudo_direction = get_change_direction(
+            pseudo_healthy_bands[band_name],
+            pseudo_depression_bands[band_name],
+        )
+
+        direction_match = (
+            real_direction
+            == pseudo_direction
+        )
+
+        direction_rows.append(
+            {
+                "Band": band_name,
+                "Real direction": real_direction,
+                "Pseudo direction": pseudo_direction,
+                "Match": (
+                    "✓" if direction_match else "✗"
+                ),
+            }
+        )
+
+    direction_df = pd.DataFrame(
+        direction_rows
+    )
+
+    number_of_matches = int(
+        np.sum(
+            direction_df["Match"] == "✓"
+        )
+    )
+
+    direction_col1, direction_col2 = (
+        st.columns([2, 1])
+    )
+
+    with direction_col1:
+        st.dataframe(
+            direction_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with direction_col2:
+        st.metric(
+            "Direction match",
+            (
+                f"{number_of_matches}/"
+                f"{len(VALIDATION_BANDS)}"
+            ),
+        )
+
+        match_percentage = (
+            100.0
+            * number_of_matches
+            / len(VALIDATION_BANDS)
+        )
+
+        st.metric(
+            "Match rate",
+            f"{match_percentage:.0f}%",
+        )
+
+    if number_of_matches == len(
+        VALIDATION_BANDS
+    ):
+        st.success(
+            "Pseudo EEG가 모든 주파수 대역에서 실제 EEG의 "
+            "Healthy→Depression 변화 방향을 재현했습니다."
+        )
+
+    elif number_of_matches >= 4:
+        st.info(
+            "Pseudo EEG가 대부분의 대역에서 실제 EEG의 "
+            "Healthy→Depression 변화 방향을 재현했습니다. "
+            "불일치 대역은 실제 변화량, 회로 변조 및 확률적 "
+            "신호 생성의 영향을 함께 고려해 해석해야 합니다."
+        )
+
+    else:
+        st.warning(
+            "Healthy→Depression 변화 방향의 일치도가 제한적입니다. "
+            "상태별 대역 프로필과 Wilson–Cowan 혼합 비율을 "
+            "추가로 점검할 필요가 있습니다."
+        )
+
+except Exception as e:
+    st.warning(
+        "대역 변화 방향을 계산하지 못했습니다: "
+        f"{e}"
     )
 
 # ============================================================
