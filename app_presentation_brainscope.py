@@ -334,21 +334,6 @@ def calculate_graph_laplacian(conn_sub):
         "metrics": metrics,
     }
 
-nonzero = weighted_degree > 1e-12
-
-degree_inverse_sqrt[
-    nonzero,
-    nonzero
-] = 1.0 / np.sqrt(
-    weighted_degree[nonzero]
-)
-
-normalized_laplacian = (
-    np.eye(len(adjacency))
-    - degree_inverse_sqrt
-    @ adjacency
-    @ degree_inverse_sqrt
-)
 
 normalized_eigenvalues = np.linalg.eigvalsh(
     normalized_laplacian
@@ -357,62 +342,6 @@ normalized_eigenvalues = np.linalg.eigvalsh(
 normalized_eigenvalues[
     np.abs(normalized_eigenvalues) < 1e-10
 ] = 0
-
-    # 대칭행렬이므로 eigvalsh 사용
-    laplacian_eigenvalues = np.linalg.eigvalsh(
-        laplacian
-    )
-
-    adjacency_eigenvalues = np.linalg.eigvalsh(
-        adjacency
-    )
-
-    # 아주 작은 수치 오차를 0으로 처리
-    laplacian_eigenvalues[
-        np.abs(laplacian_eigenvalues) < 1e-10
-    ] = 0.0
-
-    laplacian_eigenvalues = np.sort(
-        laplacian_eigenvalues
-    )
-
-    if len(laplacian_eigenvalues) >= 2:
-        algebraic_connectivity = float(
-            laplacian_eigenvalues[1]
-        )
-    else:
-        algebraic_connectivity = 0.0
-
-    metrics = {
-        "algebraic_connectivity": (
-            algebraic_connectivity
-        ),
-        "largest_laplacian_eigenvalue": float(
-            laplacian_eigenvalues[-1]
-        ),
-        "average_weighted_degree": float(
-            np.mean(weighted_degree)
-        ),
-        "spectral_radius": float(
-            np.max(np.abs(adjacency_eigenvalues))
-        ),
-        "total_edge_weight": float(
-            np.sum(adjacency) / 2.0
-        ),
-        "normalized_lambda2": float(normalized_eigenvalues[1]),
-
-"normalized_lambda_max": float(normalized_eigenvalues[-1]),
-    }
-
-    return {
-        "adjacency": adjacency,
-        "degree_matrix": degree_matrix,
-        "laplacian": laplacian,
-        "eigenvalues": laplacian_eigenvalues,
-        "weighted_degree": weighted_degree,
-        "metrics": metrics,
-    }
-
 
 def build_laplacian_comparison(active_regions):
     """
