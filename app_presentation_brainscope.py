@@ -1139,7 +1139,7 @@ def normalize_psd_area(
             "PSD 정규화에 필요한 주파수점이 부족합니다."
         )
 
-    total_area = np.trapz(
+    total_area = np.trapezoid(
         selected_power,
         selected_frequencies,
     )
@@ -1201,7 +1201,7 @@ def calculate_relative_band_power(
             continue
 
         band_power[band_name] = float(
-            np.trapz(
+            np.trapezoid(
                 normalized_power[mask],
                 frequencies[mask],
             )
@@ -1259,7 +1259,7 @@ def compare_real_and_pseudo_psd(
     )
 
     # 보간 뒤 다시 면적 정규화
-    pseudo_area = np.trapz(
+    pseudo_area = np.trapezoid(
         pseudo_interpolated,
         real_frequencies,
     )
