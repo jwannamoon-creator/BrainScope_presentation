@@ -952,9 +952,11 @@ def make_pseudo_eeg_100hz(
 # Real EEG vs Pseudo EEG validation
 # ============================================================
 
+APP_DIR = Path(__file__).resolve().parent
+
 REAL_EEG_PSD_FILES = {
-    "Healthy": Path("real_healthy_psd.csv"),
-    "Depression": Path("real_depression_psd.csv"),
+    "Healthy": APP_DIR / "real_healthy_psd.csv",
+    "Depression": APP_DIR / "real_depression_psd.csv",
 }
 
 VALIDATION_BANDS = {
