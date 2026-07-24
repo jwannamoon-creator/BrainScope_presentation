@@ -6,6 +6,8 @@ import numpy as np
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 
+from scipy.signal import welch
+
 from streamlit_autorefresh import st_autorefresh
 from nilearn import datasets
 from nilearn.surface import load_surf_mesh
@@ -17,7 +19,6 @@ from connectivity import (
     scale_matrix_for_wc,
 )
 from wc import run_wc_network
-from eeg import make_pseudo_eeg
 from hh import run_hh
 from lif import run_lif
 
@@ -246,6 +247,123 @@ def draw_brain(
     )
 
     return fig
+
+
+
+def make_pseudo_eeg_100hz(
+    t,
+    E,
+    I,
+    sfreq=100.0,
+    noise=0.04,
+    random_state=42,
+):
+    """
+    Wilson-Cowan E/I activity를 100 Hz 시간축으로 보간한 뒤,
+    1~40 Hz 범위의 모의 EEG를 생성하고 Welch PSD를 계산한다.
+
+    주의:
+    이 신호는 실제 두피 EEG가 아니라 회로 활동을 시각화하기 위한
+    모의 신호이며, 절대 진폭보다 PSD 형태와 조건 간 변화 방향을
+    비교하는 데 사용한다.
+    """
+
+    t = np.asarray(t, dtype=float)
+    E = np.asarray(E, dtype=float)
+    I = np.asarray(I, dtype=float)
+
+    if t.ndim != 1:
+        raise ValueError("t는 1차원 시간 배열이어야 합니다.")
+
+    if E.ndim != 2 or I.ndim != 2:
+        raise ValueError("E와 I는 (영역 수, 시간점 수) 형태의 2차원 배열이어야 합니다.")
+
+    if E.shape != I.shape:
+        raise ValueError("E와 I의 배열 크기가 서로 같아야 합니다.")
+
+    if E.shape[1] != len(t):
+        raise ValueError("E/I의 시간축 길이와 t의 길이가 일치해야 합니다.")
+
+    if sfreq <= 80:
+        raise ValueError("40 Hz까지 분석하려면 sfreq는 80 Hz보다 커야 합니다.")
+
+    duration = float(t[-1] - t[0])
+
+    if duration <= 0:
+        raise ValueError("기록 길이가 0초보다 커야 합니다.")
+
+    pseudo_time = np.arange(
+        t[0],
+        t[-1] + 0.5 / sfreq,
+        1.0 / sfreq,
+    )
+
+    mean_E = np.mean(E, axis=0)
+    mean_I = np.mean(I, axis=0)
+
+    interp_E = np.interp(pseudo_time, t, mean_E)
+    interp_I = np.interp(pseudo_time, t, mean_I)
+
+    circuit_signal = interp_E - 0.6 * interp_I
+    circuit_signal = circuit_signal - np.mean(circuit_signal)
+
+    signal_std = np.std(circuit_signal)
+    if signal_std > 0:
+        circuit_signal = circuit_signal / signal_std
+
+    # E/I 상태에 따라 진동 성분의 상대 진폭이 조금씩 달라지도록 설정
+    excitation_level = float(np.clip(np.mean(interp_E), 0.0, 1.0))
+    inhibition_level = float(np.clip(np.mean(interp_I), 0.0, 1.0))
+    variability = float(np.clip(np.std(interp_E - interp_I), 0.0, 1.0))
+
+    delta_amp = 0.18 + 0.12 * inhibition_level
+    theta_amp = 0.16 + 0.16 * variability
+    alpha_amp = 0.28 + 0.18 * inhibition_level
+    beta_amp = 0.14 + 0.18 * excitation_level
+    gamma_amp = 0.06 + 0.10 * excitation_level
+
+    envelope = 0.75 + 0.25 * np.tanh(interp_E - interp_I)
+
+    oscillation = (
+        delta_amp * np.sin(2 * np.pi * 2.5 * pseudo_time)
+        + theta_amp * np.sin(2 * np.pi * 6.0 * pseudo_time + 0.4)
+        + alpha_amp * np.sin(2 * np.pi * 10.0 * pseudo_time + 0.8)
+        + beta_amp * np.sin(2 * np.pi * 20.0 * pseudo_time + 1.2)
+        + gamma_amp * np.sin(2 * np.pi * 35.0 * pseudo_time + 0.2)
+    )
+
+    rng = np.random.default_rng(random_state)
+
+    pseudo_eeg = (
+        0.35 * circuit_signal
+        + envelope * oscillation
+        + rng.normal(0.0, noise, size=len(pseudo_time))
+    )
+
+    pseudo_eeg = pseudo_eeg - np.mean(pseudo_eeg)
+
+    # 4초 Welch 창, 50% 중첩
+    nperseg = min(int(4 * sfreq), len(pseudo_eeg))
+    noverlap = nperseg // 2
+
+    freqs, power = welch(
+        pseudo_eeg,
+        fs=sfreq,
+        window="hann",
+        nperseg=nperseg,
+        noverlap=noverlap,
+        detrend="constant",
+        scaling="density",
+    )
+
+    frequency_mask = (freqs >= 0.0) & (freqs <= 40.0)
+
+    return (
+        pseudo_time,
+        pseudo_eeg,
+        freqs[frequency_mask],
+        power[frequency_mask],
+    )
 
 
 # ============================================================
@@ -579,58 +697,95 @@ else:
 
 st.subheader("4. Pseudo EEG")
 
-# 실행할 때마다 동일한 모의 EEG가 생성되도록 난수 시드를 고정함.
-# Healthy와 Depression 결과를 같은 조건에서 비교하기 위한 설정임.
-np.random.seed(42)
+PSEUDO_EEG_SFREQ = 100.0
 
-pseudo_eeg, freqs, power = make_pseudo_eeg(E_wc, I_wc, noise=0.04)
+pseudo_eeg_time, pseudo_eeg, freqs, power = make_pseudo_eeg_100hz(
+    t=t_wc,
+    E=E_wc,
+    I=I_wc,
+    sfreq=PSEUDO_EEG_SFREQ,
+    noise=0.04,
+    random_state=42,
+)
 
 eeg_col1, eeg_col2 = st.columns(2)
 
 with eeg_col1:
     fig_eeg, ax = plt.subplots(figsize=(7, 3))
-    ax.plot(t_wc, pseudo_eeg)
-    ax.axvline(activity_time, linestyle="--", alpha=0.7)
-    ax.set_xlabel("Time")
+
+    ax.plot(
+        pseudo_eeg_time,
+        pseudo_eeg,
+        linewidth=1.0,
+    )
+
+    ax.axvline(
+        activity_time,
+        linestyle="--",
+        alpha=0.7,
+    )
+
+    ax.set_xlabel("Time (s)")
     ax.set_ylabel("Signal")
-    ax.set_title("Pseudo EEG Raw Signal")
+    ax.set_title(
+        f"Pseudo EEG Raw Signal ({PSEUDO_EEG_SFREQ:.0f} Hz)"
+    )
     ax.grid(True)
+
     st.pyplot(fig_eeg)
+    plt.close(fig_eeg)
 
 with eeg_col2:
     fig_fft, ax = plt.subplots(figsize=(7, 3))
-    ax.plot(freqs, power)
+
+    ax.plot(
+        freqs,
+        power,
+        linewidth=1.0,
+    )
+
     ax.set_xlim(0, 40)
-    ax.set_xlabel("Frequency")
-    ax.set_ylabel("Power")
-    ax.set_title("FFT Power Spectrum")
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Power spectral density")
+    ax.set_title("Welch Power Spectrum")
     ax.grid(True)
+
     st.pyplot(fig_fft)
+    plt.close(fig_fft)
+
+st.caption(
+    "Pseudo EEG는 Wilson–Cowan 회로 활동을 100 Hz로 보간해 생성한 "
+    "모의 신호이며, 실제 두피 EEG와 동일한 신호는 아닙니다."
+)
 
 # ============================================================
 # CSV 다운로드
 # ============================================================
 
-# Raw EEG 데이터
 raw_eeg_df = pd.DataFrame({
-    "time": t_wc,
-    "pseudo_eeg": pseudo_eeg
+    "time_sec": pseudo_eeg_time,
+    "pseudo_eeg": pseudo_eeg,
 })
 
-# FFT 데이터
 fft_df = pd.DataFrame({
     "frequency_hz": freqs,
-    "power": power
+    "power": power,
 })
 
-# 파일명에 사용할 안전한 문자열
-# 사이드바에서 실제로 사용 중인 변수명은 selected_circuit과
-# brain_dataset_label이므로 이 두 변수를 사용함.
 safe_circuit = selected_circuit.replace(" ", "_")
 safe_state = brain_dataset_label.replace(" ", "_")
 
-raw_eeg_csv = raw_eeg_df.to_csv(index=False).encode("utf-8-sig")
-fft_csv = fft_df.to_csv(index=False).encode("utf-8-sig")
+raw_eeg_csv = (
+    raw_eeg_df
+    .to_csv(index=False)
+    .encode("utf-8-sig")
+)
+
+fft_csv = (
+    fft_df
+    .to_csv(index=False)
+    .encode("utf-8-sig")
+)
 
 download_col1, download_col2 = st.columns(2)
 
@@ -638,16 +793,22 @@ with download_col1:
     st.download_button(
         label="📥 Pseudo EEG Raw CSV 저장",
         data=raw_eeg_csv,
-        file_name=f"{safe_state}_{safe_circuit}_pseudo_eeg_raw.csv",
-        mime="text/csv"
+        file_name=(
+            f"{safe_state}_{safe_circuit}"
+            "_pseudo_eeg_raw.csv"
+        ),
+        mime="text/csv",
     )
 
 with download_col2:
     st.download_button(
-        label="📥 FFT Spectrum CSV 저장",
+        label="📥 Welch PSD CSV 저장",
         data=fft_csv,
-        file_name=f"{safe_state}_{safe_circuit}_pseudo_eeg_fft.csv",
-        mime="text/csv"
+        file_name=(
+            f"{safe_state}_{safe_circuit}"
+            "_pseudo_eeg_welch_psd.csv"
+        ),
+        mime="text/csv",
     )
 
 # ============================================================
