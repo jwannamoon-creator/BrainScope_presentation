@@ -160,13 +160,19 @@ def prepare_laplacian_adjacency(conn_sub):
 
 def calculate_graph_laplacian(conn_sub):
     """
-    비정규화 Graph Laplacian L = D - A를 계산하고
-    네트워크 지표를 반환한다.
+    비정규화 Graph Laplacian과 정규화 Graph Laplacian을 계산한다.
+
+    L = D - A
+    L_norm = I - D^(-1/2) A D^(-1/2)
     """
 
     adjacency = prepare_laplacian_adjacency(
         conn_sub
     )
+
+    # --------------------------------------------------------
+    # Degree matrix
+    # --------------------------------------------------------
 
     weighted_degree = np.sum(
         adjacency,
@@ -177,13 +183,156 @@ def calculate_graph_laplacian(conn_sub):
         weighted_degree
     )
 
+    # --------------------------------------------------------
+    # Unnormalized Laplacian
+    # --------------------------------------------------------
+
     laplacian = (
         degree_matrix - adjacency
     )
 
-    degree_inverse_sqrt = np.zeros_like(
-    degree_matrix
-)
+    laplacian_eigenvalues = np.linalg.eigvalsh(
+        laplacian
+    )
+
+    laplacian_eigenvalues[
+        np.abs(laplacian_eigenvalues) < 1e-10
+    ] = 0.0
+
+    laplacian_eigenvalues = np.sort(
+        laplacian_eigenvalues
+    )
+
+    # --------------------------------------------------------
+    # Normalized Laplacian
+    # --------------------------------------------------------
+
+    inverse_sqrt_degree = np.zeros(
+        len(weighted_degree),
+        dtype=float,
+    )
+
+    nonzero_degree_mask = (
+        weighted_degree > 1e-12
+    )
+
+    inverse_sqrt_degree[
+        nonzero_degree_mask
+    ] = (
+        1.0
+        / np.sqrt(
+            weighted_degree[
+                nonzero_degree_mask
+            ]
+        )
+    )
+
+    degree_inverse_sqrt_matrix = np.diag(
+        inverse_sqrt_degree
+    )
+
+    normalized_laplacian = (
+        np.eye(
+            len(adjacency),
+            dtype=float,
+        )
+        - degree_inverse_sqrt_matrix
+        @ adjacency
+        @ degree_inverse_sqrt_matrix
+    )
+
+    # 고립 노드가 있을 때 대각값을 0으로 설정
+    isolated_node_mask = (
+        weighted_degree <= 1e-12
+    )
+
+    normalized_laplacian[
+        isolated_node_mask,
+        isolated_node_mask,
+    ] = 0.0
+
+    normalized_eigenvalues = np.linalg.eigvalsh(
+        normalized_laplacian
+    )
+
+    normalized_eigenvalues[
+        np.abs(normalized_eigenvalues) < 1e-10
+    ] = 0.0
+
+    normalized_eigenvalues = np.sort(
+        normalized_eigenvalues
+    )
+
+    # --------------------------------------------------------
+    # Adjacency eigenvalues
+    # --------------------------------------------------------
+
+    adjacency_eigenvalues = np.linalg.eigvalsh(
+        adjacency
+    )
+
+    # --------------------------------------------------------
+    # Metrics
+    # --------------------------------------------------------
+
+    if len(laplacian_eigenvalues) >= 2:
+        algebraic_connectivity = float(
+            laplacian_eigenvalues[1]
+        )
+    else:
+        algebraic_connectivity = 0.0
+
+    if len(normalized_eigenvalues) >= 2:
+        normalized_lambda2 = float(
+            normalized_eigenvalues[1]
+        )
+    else:
+        normalized_lambda2 = 0.0
+
+    metrics = {
+        "algebraic_connectivity": (
+            algebraic_connectivity
+        ),
+        "normalized_lambda2": (
+            normalized_lambda2
+        ),
+        "largest_laplacian_eigenvalue": float(
+            laplacian_eigenvalues[-1]
+        ),
+        "normalized_lambda_max": float(
+            normalized_eigenvalues[-1]
+        ),
+        "average_weighted_degree": float(
+            np.mean(weighted_degree)
+        ),
+        "spectral_radius": float(
+            np.max(
+                np.abs(
+                    adjacency_eigenvalues
+                )
+            )
+        ),
+        "total_edge_weight": float(
+            np.sum(adjacency) / 2.0
+        ),
+    }
+
+    return {
+        "adjacency": adjacency,
+        "degree_matrix": degree_matrix,
+        "laplacian": laplacian,
+        "normalized_laplacian": (
+            normalized_laplacian
+        ),
+        "eigenvalues": (
+            laplacian_eigenvalues
+        ),
+        "normalized_eigenvalues": (
+            normalized_eigenvalues
+        ),
+        "weighted_degree": weighted_degree,
+        "metrics": metrics,
+    }
 
 nonzero = weighted_degree > 1e-12
 
@@ -1824,22 +1973,29 @@ if laplacian_available:
             ),
         )
 
-    with lap_col4:
-        radius_difference = (
-            depression_metrics["spectral_radius"]
-            - healthy_metrics["spectral_radius"]
-        )
+with lap_col4:
+    normalized_lambda2_difference = (
+        depression_metrics[
+            "normalized_lambda2"
+        ]
+        - healthy_metrics[
+            "normalized_lambda2"
+        ]
+    )
 
-        st.metric(
-            "Adjacency spectral radius",
-            (
-                f"{depression_metrics['spectral_radius']:.4f}"
-            ),
-            delta=f"{radius_difference:+.4f}",
-            help=(
-                "인접행렬 고유값 절댓값 중 최댓값입니다."
-            ),
-        )
+    st.metric(
+        "Normalized λ₂",
+        (
+            f"{depression_metrics['normalized_lambda2']:.4f}"
+        ),
+        delta=(
+            f"{normalized_lambda2_difference:+.4f}"
+        ),
+        help=(
+            "노드별 연결 강도 차이를 보정한 "
+            "정규화 Laplacian의 두 번째 고유값입니다."
+        ),
+    )
 
     spectrum_col, matrix_col = st.columns(
         [1.1, 1]
@@ -1967,7 +2123,9 @@ if laplacian_available:
         {
             "Metric": [
                 "Algebraic connectivity λ₂",
+                "Normalized algebraic connectivity λ₂",
                 "Largest Laplacian eigenvalue",
+                "Largest normalized Laplacian eigenvalue",
                 "Average weighted degree",
                 "Adjacency spectral radius",
                 "Total edge weight",
