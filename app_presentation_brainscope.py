@@ -6,7 +6,7 @@ import numpy as np
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 
-from scipy.signal import welch
+from scipy.signal import welch, butter, sosfiltfilt
 
 from streamlit_autorefresh import st_autorefresh
 from nilearn import datasets
@@ -248,103 +248,409 @@ def draw_brain(
 
     return fig
 
+
+# ============================================================
+# Pseudo EEG v2
+# 영역별 E/I 활동 + 회로별 가중치 + 상태별 스펙트럼 보정
+# ============================================================
+
+PSEUDO_EEG_BANDS = {
+    "Delta": (1.0, 4.0),
+    "Theta": (4.0, 8.0),
+    "Alpha": (8.0, 13.0),
+    "Beta": (13.0, 30.0),
+    "Gamma": (30.0, 40.0),
+}
+
+# 실제 EEG 두 사례에서 얻은 상대 대역 파워를 모델 보정값으로 사용함.
+# 따라서 v2의 결과는 독립적 임상 검증이 아니라 calibration 결과로 해석해야 함.
+STATE_BAND_PROFILE = {
+    "Healthy": {
+        "Delta": 0.248595,
+        "Theta": 0.103795,
+        "Alpha": 0.258479,
+        "Beta": 0.249581,
+        "Gamma": 0.114941,
+    },
+    "Depression": {
+        "Delta": 0.283521,
+        "Theta": 0.101867,
+        "Alpha": 0.444172,
+        "Beta": 0.126937,
+        "Gamma": 0.020432,
+    },
+}
+
+# 상태 차이를 유지하면서 감정 회로와 기억 회로가 완전히 같은
+# 스펙트럼을 생성하지 않도록 작은 회로별 변조를 적용함.
+CIRCUIT_BAND_MULTIPLIER = {
+    "Emotion Circuit": {
+        "Delta": 1.06,
+        "Theta": 1.10,
+        "Alpha": 0.90,
+        "Beta": 1.06,
+        "Gamma": 1.03,
+    },
+    "Memory Circuit": {
+        "Delta": 0.94,
+        "Theta": 1.08,
+        "Alpha": 1.10,
+        "Beta": 0.96,
+        "Gamma": 0.94,
+    },
+}
+
+# 회로마다 기여도가 높은 영역을 다르게 가중함.
+REGION_KEYWORD_WEIGHTS = {
+    "Emotion Circuit": {
+        "amygdala": 1.45,
+        "insula": 1.25,
+        "acc": 1.25,
+        "pfc": 1.15,
+        "ofc": 1.15,
+        "hippocampus": 0.90,
+        "pcc": 0.85,
+    },
+    "Memory Circuit": {
+        "hippocampus": 1.50,
+        "dg": 1.35,
+        "ca3": 1.35,
+        "ca1": 1.35,
+        "parahippocampal": 1.25,
+        "pcc": 1.05,
+        "angular": 1.00,
+        "pfc": 0.90,
+        "amygdala": 0.80,
+    },
+}
+
+
+def _zscore_signal(signal):
+    signal = np.asarray(signal, dtype=float)
+    signal = signal - np.mean(signal)
+
+    standard_deviation = float(np.std(signal))
+    if standard_deviation > 1e-12:
+        signal = signal / standard_deviation
+
+    return signal
+
+
+def _get_region_weights(region_names, circuit):
+    keyword_weights = REGION_KEYWORD_WEIGHTS[circuit]
+    weights = np.ones(len(region_names), dtype=float)
+
+    for index, region_name in enumerate(region_names):
+        normalized_name = str(region_name).lower().replace(" ", "")
+        matched_weights = []
+
+        for keyword, weight in keyword_weights.items():
+            normalized_keyword = keyword.lower().replace(" ", "")
+            if normalized_keyword in normalized_name:
+                matched_weights.append(weight)
+
+        if matched_weights:
+            weights[index] = max(matched_weights)
+
+    weights = weights / np.sum(weights)
+    return weights
+
+
+def _make_band_limited_noise(
+    n_samples,
+    sfreq,
+    low_frequency,
+    high_frequency,
+    rng,
+):
+    white_noise = rng.normal(0.0, 1.0, n_samples)
+
+    nyquist = sfreq / 2.0
+    low_normalized = max(low_frequency / nyquist, 1e-5)
+    high_normalized = min(high_frequency / nyquist, 0.999)
+
+    if not 0 < low_normalized < high_normalized < 1:
+        raise ValueError(
+            f"{low_frequency}-{high_frequency} Hz 대역을 "
+            f"{sfreq} Hz 샘플링 주파수에서 생성할 수 없습니다."
+        )
+
+    sos = butter(
+        4,
+        [low_normalized, high_normalized],
+        btype="bandpass",
+        output="sos",
+    )
+
+    filtered_noise = sosfiltfilt(sos, white_noise)
+    return _zscore_signal(filtered_noise)
+
+
+def _get_target_band_profile(brain_state, circuit):
+    profile = {}
+
+    for band_name in PSEUDO_EEG_BANDS:
+        profile[band_name] = (
+            STATE_BAND_PROFILE[brain_state][band_name]
+            * CIRCUIT_BAND_MULTIPLIER[circuit][band_name]
+        )
+
+    total_power = sum(profile.values())
+
+    return {
+        band_name: band_power / total_power
+        for band_name, band_power in profile.items()
+    }
+
+
+def _get_condition_seed(brain_state, circuit, random_state):
+    seed_offset = {
+        ("Healthy", "Emotion Circuit"): 101,
+        ("Healthy", "Memory Circuit"): 211,
+        ("Depression", "Emotion Circuit"): 307,
+        ("Depression", "Memory Circuit"): 401,
+    }
+
+    return int(
+        random_state
+        + seed_offset[(brain_state, circuit)]
+    )
+
+
 def make_pseudo_eeg_100hz(
     t,
     E,
     I,
+    region_names,
+    circuit,
+    brain_state,
     sfreq=100.0,
-    noise=0.03,
+    noise=0.025,
     random_state=42,
+    wc_mix=0.18,
 ):
+    """
+    BrainScope pseudo EEG v2.
+
+    Wilson-Cowan의 영역별 E/I 활동을 회로별로 가중합하고,
+    Healthy/Depression 상태별 대역 파워와 감정/기억 회로별
+    스펙트럼 변조를 반영하여 100 Hz 모의 EEG를 생성한다.
+
+    반환값
+    -------
+    pseudo_time
+    pseudo_eeg
+    freqs
+    power
+    target_profile
+    """
 
     t = np.asarray(t, dtype=float)
     E = np.asarray(E, dtype=float)
     I = np.asarray(I, dtype=float)
+    region_names = list(region_names)
+
+    if t.ndim != 1 or len(t) < 3:
+        raise ValueError("t는 길이 3 이상인 1차원 시간 배열이어야 합니다.")
+
+    if E.ndim != 2 or I.ndim != 2:
+        raise ValueError(
+            "E와 I는 (영역 수, 시간점 수) 형태의 2차원 배열이어야 합니다."
+        )
+
+    if E.shape != I.shape:
+        raise ValueError("E와 I의 배열 크기가 서로 같아야 합니다.")
+
+    if E.shape[0] != len(region_names):
+        raise ValueError(
+            "region_names의 길이는 E/I의 영역 수와 같아야 합니다."
+        )
+
+    if E.shape[1] != len(t):
+        raise ValueError(
+            "E/I의 시간축 길이와 t의 길이가 일치해야 합니다."
+        )
+
+    if circuit not in CIRCUIT_BAND_MULTIPLIER:
+        raise ValueError(
+            f"지원하지 않는 회로입니다: {circuit}"
+        )
+
+    if brain_state not in STATE_BAND_PROFILE:
+        raise ValueError(
+            f"지원하지 않는 뇌 상태입니다: {brain_state}"
+        )
+
+    if sfreq <= 80:
+        raise ValueError(
+            "40 Hz까지 분석하려면 sfreq는 80 Hz보다 커야 합니다."
+        )
+
+    duration = float(t[-1] - t[0])
+    if duration <= 0:
+        raise ValueError("기록 길이는 0초보다 커야 합니다.")
 
     pseudo_time = np.arange(
-        t[0],
-        t[-1] + 0.5/sfreq,
-        1/sfreq,
+        float(t[0]),
+        float(t[-1]) + 0.5 / sfreq,
+        1.0 / sfreq,
     )
 
-    mean_E = np.mean(E, axis=0)
-    mean_I = np.mean(I, axis=0)
+    # --------------------------------------------------------
+    # 1. 회로별 영역 가중 Wilson-Cowan source
+    # --------------------------------------------------------
 
-    interp_E = np.interp(pseudo_time, t, mean_E)
-    interp_I = np.interp(pseudo_time, t, mean_I)
-
-    # -------------------------
-    # Wilson-Cowan source
-    # -------------------------
-
-    circuit_signal = interp_E - 0.8*interp_I
-
-    circuit_signal -= np.mean(circuit_signal)
-    circuit_signal /= np.std(circuit_signal)
-
-    excitation = np.clip(np.mean(interp_E),0,1)
-    inhibition = np.clip(np.mean(interp_I),0,1)
-
-    variability = np.std(interp_E-interp_I)
-
-    # -------------------------
-    # amplitude
-    # -------------------------
-
-    delta_amp = 0.18 + 0.18*inhibition
-    theta_amp = 0.18 + 0.25*variability
-    alpha_amp = 0.22 + 0.10*inhibition
-    beta_amp = 0.16 + 0.25*excitation
-    gamma_amp = 0.05 + 0.18*excitation
-
-    # -------------------------
-    # envelope
-    # -------------------------
-
-    envelope = 1 + 0.35*np.tanh(circuit_signal)
-
-    envelope += 0.15*np.sin(
-        2*np.pi*0.2*pseudo_time
+    region_weights = _get_region_weights(
+        region_names,
+        circuit,
     )
 
-    rng = np.random.default_rng(random_state)
-
-    phase = rng.uniform(0,2*np.pi,5)
-
-    oscillation = (
-        delta_amp*np.sin(2*np.pi*2.5*pseudo_time+phase[0])+
-        theta_amp*np.sin(2*np.pi*6*pseudo_time+phase[1])+
-        alpha_amp*np.sin(2*np.pi*10*pseudo_time+phase[2])+
-        beta_amp*np.sin(2*np.pi*20*pseudo_time+phase[3])+
-        gamma_amp*np.sin(2*np.pi*35*pseudo_time+phase[4])
+    weighted_ei = np.sum(
+        region_weights[:, None]
+        * (E - 0.72 * I),
+        axis=0,
     )
 
-    oscillation *= envelope
+    weighted_e = np.sum(
+        region_weights[:, None] * E,
+        axis=0,
+    )
 
-    # -------------------------
-    # colored noise
-    # -------------------------
+    wc_source = (
+        0.78 * weighted_ei
+        + 0.22 * weighted_e
+    )
 
-    white = rng.normal(size=len(pseudo_time))
+    interpolated_wc = np.interp(
+        pseudo_time,
+        t,
+        wc_source,
+    )
+    interpolated_wc = _zscore_signal(interpolated_wc)
 
-    colored = np.cumsum(white)
-    colored -= np.mean(colored)
-    colored /= np.std(colored)
+    # Wilson-Cowan 흥분성 활동을 느린 진폭 envelope로 반영
+    interpolated_e = np.interp(
+        pseudo_time,
+        t,
+        weighted_e,
+    )
+    interpolated_e = _zscore_signal(interpolated_e)
+
+    envelope = (
+        1.0
+        + 0.14 * np.tanh(interpolated_e)
+    )
+
+    # --------------------------------------------------------
+    # 2. 상태·회로별 목표 대역 파워
+    # --------------------------------------------------------
+
+    target_profile = _get_target_band_profile(
+        brain_state,
+        circuit,
+    )
+
+    condition_seed = _get_condition_seed(
+        brain_state,
+        circuit,
+        random_state,
+    )
+    rng = np.random.default_rng(condition_seed)
+
+    spectral_signal = np.zeros(
+        len(pseudo_time),
+        dtype=float,
+    )
+
+    for band_name, (
+        low_frequency,
+        high_frequency,
+    ) in PSEUDO_EEG_BANDS.items():
+
+        band_component = _make_band_limited_noise(
+            n_samples=len(pseudo_time),
+            sfreq=sfreq,
+            low_frequency=low_frequency,
+            high_frequency=high_frequency,
+            rng=rng,
+        )
+
+        # 파워는 진폭의 제곱에 비례하므로 sqrt를 적용함.
+        amplitude = np.sqrt(
+            target_profile[band_name]
+        )
+
+        spectral_signal += (
+            amplitude * band_component
+        )
+
+    spectral_signal = (
+        envelope * spectral_signal
+    )
+    spectral_signal = _zscore_signal(
+        spectral_signal
+    )
+
+    # --------------------------------------------------------
+    # 3. 회로별 위상 및 상태별 중심주파수 차이
+    # --------------------------------------------------------
+
+    phase_shift = {
+        "Emotion Circuit": 0.35,
+        "Memory Circuit": 0.95,
+    }[circuit]
+
+    alpha_frequency = (
+        10.0
+        if brain_state == "Healthy"
+        else 9.5
+    )
+
+    rhythmic_component = (
+        0.10
+        * np.sin(
+            2.0
+            * np.pi
+            * alpha_frequency
+            * pseudo_time
+            + phase_shift
+        )
+        + 0.045
+        * np.sin(
+            2.0
+            * np.pi
+            * 6.0
+            * pseudo_time
+            + 0.5 * phase_shift
+        )
+    )
+
+    # --------------------------------------------------------
+    # 4. 최종 pseudo EEG
+    # --------------------------------------------------------
 
     pseudo_eeg = (
-        0.45*circuit_signal
-        + oscillation
-        + 0.18*colored
-        + rng.normal(0,noise,len(pseudo_time))
+        np.sqrt(max(0.0, 1.0 - wc_mix ** 2))
+        * spectral_signal
+        + wc_mix * interpolated_wc
+        + rhythmic_component
+        + rng.normal(
+            0.0,
+            noise,
+            len(pseudo_time),
+        )
     )
 
-    pseudo_eeg -= np.mean(pseudo_eeg)
-    pseudo_eeg /= np.std(pseudo_eeg)
+    pseudo_eeg = _zscore_signal(pseudo_eeg)
 
-    nperseg = min(int(4*sfreq),len(pseudo_eeg))
-    noverlap = nperseg//2
+    # 4초 Welch 창, 50% 중첩
+    nperseg = min(
+        int(round(4.0 * sfreq)),
+        len(pseudo_eeg),
+    )
+    noverlap = nperseg // 2
 
-    freqs,power = welch(
+    freqs, power = welch(
         pseudo_eeg,
         fs=sfreq,
         window="hann",
@@ -354,15 +660,18 @@ def make_pseudo_eeg_100hz(
         scaling="density",
     )
 
-    mask=(freqs>=0)&(freqs<=40)
+    frequency_mask = (
+        (freqs >= 0.0)
+        & (freqs <= 40.0)
+    )
 
     return (
         pseudo_time,
         pseudo_eeg,
-        freqs[mask],
-        power[mask],
+        freqs[frequency_mask],
+        power[frequency_mask],
+        target_profile,
     )
-
 
 
 # ============================================================
@@ -698,13 +1007,23 @@ st.subheader("4. Pseudo EEG")
 
 PSEUDO_EEG_SFREQ = 100.0
 
-pseudo_eeg_time, pseudo_eeg, freqs, power = make_pseudo_eeg_100hz(
+(
+    pseudo_eeg_time,
+    pseudo_eeg,
+    freqs,
+    power,
+    target_profile,
+) = make_pseudo_eeg_100hz(
     t=t_wc,
     E=E_wc,
     I=I_wc,
+    region_names=active_regions,
+    circuit=selected_circuit,
+    brain_state=brain_dataset_label,
     sfreq=PSEUDO_EEG_SFREQ,
-    noise=0.04,
+    noise=0.025,
     random_state=42,
+    wc_mix=0.18,
 )
 
 eeg_col1, eeg_col2 = st.columns(2)
@@ -753,9 +1072,22 @@ with eeg_col2:
     plt.close(fig_fft)
 
 st.caption(
-    "Pseudo EEG는 Wilson–Cowan 회로 활동을 100 Hz로 보간해 생성한 "
-    "모의 신호이며, 실제 두피 EEG와 동일한 신호는 아닙니다."
+    "Pseudo EEG v2는 Wilson–Cowan의 영역별 E/I 활동, 회로별 영역 가중치, "
+    "상태별 대역 파워 보정을 결합한 모의 신호입니다. 상태별 보정값은 현재 "
+    "실제 EEG 사례에서 추정했으므로 독립적 임상 검증이 아닌 calibration "
+    "결과로 해석해야 합니다."
 )
+
+with st.expander("Pseudo EEG v2 목표 상대 대역 파워"):
+    st.dataframe(
+        pd.DataFrame(
+            {
+                "Band": list(target_profile.keys()),
+                "Target relative power": list(target_profile.values()),
+            }
+        ),
+        use_container_width=True,
+    )
 
 # ============================================================
 # CSV 다운로드
@@ -794,7 +1126,7 @@ with download_col1:
         data=raw_eeg_csv,
         file_name=(
             f"{safe_state}_{safe_circuit}"
-            "_pseudo_eeg_raw.csv"
+            "_pseudo_eeg_v2_raw.csv"
         ),
         mime="text/csv",
     )
@@ -805,7 +1137,7 @@ with download_col2:
         data=fft_csv,
         file_name=(
             f"{safe_state}_{safe_circuit}"
-            "_pseudo_eeg_welch_psd.csv"
+            "_pseudo_eeg_v2_welch_psd.csv"
         ),
         mime="text/csv",
     )
