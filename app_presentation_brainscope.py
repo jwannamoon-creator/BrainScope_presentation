@@ -176,6 +176,34 @@ def calculate_graph_laplacian(conn_sub):
         degree_matrix - adjacency
     )
 
+    degree_inverse_sqrt = np.zeros_like(
+    degree_matrix
+)
+
+nonzero = weighted_degree > 1e-12
+
+degree_inverse_sqrt[
+    nonzero,
+    nonzero
+] = 1.0 / np.sqrt(
+    weighted_degree[nonzero]
+)
+
+normalized_laplacian = (
+    np.eye(len(adjacency))
+    - degree_inverse_sqrt
+    @ adjacency
+    @ degree_inverse_sqrt
+)
+
+normalized_eigenvalues = np.linalg.eigvalsh(
+    normalized_laplacian
+)
+
+normalized_eigenvalues[
+    np.abs(normalized_eigenvalues) < 1e-10
+] = 0
+
     # 대칭행렬이므로 eigvalsh 사용
     laplacian_eigenvalues = np.linalg.eigvalsh(
         laplacian
@@ -217,6 +245,9 @@ def calculate_graph_laplacian(conn_sub):
         "total_edge_weight": float(
             np.sum(adjacency) / 2.0
         ),
+        "normalized_lambda2": float(normalized_eigenvalues[1]),
+
+"normalized_lambda_max": float(normalized_eigenvalues[-1]),
     }
 
     return {
