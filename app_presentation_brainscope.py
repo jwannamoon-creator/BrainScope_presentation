@@ -953,12 +953,8 @@ def make_pseudo_eeg_100hz(
 # ============================================================
 
 REAL_EEG_PSD_FILES = {
-    "Healthy": Path(
-        "real_eeg_reference/real_healthy_psd.csv"
-    ),
-    "Depression": Path(
-        "real_eeg_reference/real_depression_psd.csv"
-    ),
+    "Healthy": Path("real_healthy_psd.csv"),
+    "Depression": Path("real_depression_psd.csv"),
 }
 
 VALIDATION_BANDS = {
